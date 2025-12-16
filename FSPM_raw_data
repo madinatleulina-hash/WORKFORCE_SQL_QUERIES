@@ -1,0 +1,155 @@
+WITH employee_contracts AS (
+    -- get weekly contract hours and calculate monthly target
+    SELECT 
+        WF_ID, 
+        EMAIL_ADDRESS,
+        PREFERRED_HOURS AS PREFERRED_HOURS_WEEKLY,
+        (COALESCE(PREFERRED_HOURS, 0) * 4.33) AS PREFERRED_HOURS_MONTHLY
+    FROM mart.workforce.employee
+),
+
+shifts_clean AS (
+    -- clean shifts: dedupe + duration
+    SELECT
+        WF_ID, COUNTRY, CITY, TEAM_NAME, WAREHOUSE_NAME, EMPLOYMENT_TYPE,
+        SHIFT_ID, SHIFT_DATE, SHIFT_START_LOCAL, SHIFT_FINISH_LOCAL,
+        TIMEDIFF(MINUTE, SHIFT_START_LOCAL, SHIFT_FINISH_LOCAL) / 60.0 AS SHIFT_DURATION_HOURS,
+        ROW_NUMBER() OVER (PARTITION BY WF_ID, SHIFT_DATE ORDER BY SHIFT_START_LOCAL ASC) as shift_rank
+    FROM mart.workforce.shifts
+    WHERE 
+        SHIFT_START_LOCAL >= DATE_TRUNC('MONTH', DATEADD(MONTH, -1, CURRENT_DATE()))
+        AND SHIFT_START_LOCAL < DATE_TRUNC('MONTH', CURRENT_DATE())
+),
+
+schedules_clean AS (
+    --schedules cleaned and deduped
+    SELECT
+        wf_id, job_title, SCHEDULE_ID, SCHEDULE_DATE, SCHEDULE_START, SCHEDULE_FINISH,
+        CONVERT_TIMEZONE('UTC', 
+            CASE COUNTRY 
+                WHEN 'germany' THEN 'Europe/Berlin' WHEN 'france' THEN 'Europe/Paris' WHEN 'spain' THEN 'Europe/Madrid' 
+                WHEN 'italy' THEN 'Europe/Rome' WHEN 'sweden' THEN 'Europe/Stockholm' WHEN 'norway' THEN 'Europe/Oslo' 
+                WHEN 'austria' THEN 'Europe/Vienna' WHEN 'poland' THEN 'Europe/Warsaw' WHEN 'belgium' THEN 'Europe/Brussels' 
+                WHEN 'switzerland' THEN 'Europe/Zurich' WHEN 'denmark' THEN 'Europe/Copenhagen' WHEN 'united kingdom' THEN 'Europe/London' 
+                WHEN 'finland' THEN 'Europe/Helsinki' ELSE 'UTC' 
+            END,
+            SCHEDULE_START::TIMESTAMP_NTZ
+        ) AS SCHEDULE_START_LOCALIZED,
+        ROW_NUMBER() OVER (PARTITION BY wf_id, SCHEDULE_DATE ORDER BY LAST_PUBLISHED_AT DESC) as schedule_rank
+    FROM mart.workforce.schedules
+    WHERE 
+        SCHEDULE_START >= DATE_TRUNC('MONTH', DATEADD(MONTH, -1, CURRENT_DATE()))
+        AND SCHEDULE_START < DATE_TRUNC('MONTH', CURRENT_DATE())
+),
+
+joined_daily_data AS (
+    --- joining, data prep step + Compliance Flag Creation
+    SELECT 
+        s.wf_id, s.job_title, 
+        t.COUNTRY, t.CITY, t.WAREHOUSE_NAME, t.TEAM_NAME, t.EMPLOYMENT_TYPE,
+        s.SCHEDULE_DATE,
+        DATE_TRUNC('MONTH', s.SCHEDULE_DATE) AS SHIFT_MONTH,
+        s.SCHEDULE_ID, s.SCHEDULE_START_LOCALIZED, s.SCHEDULE_FINISH,
+        t.SHIFT_ID, t.SHIFT_START_LOCAL, t.SHIFT_FINISH_LOCAL, t.SHIFT_DURATION_HOURS,
+        TIMEDIFF(MINUTE, s.SCHEDULE_START_LOCALIZED, t.SHIFT_START_LOCAL) AS START_VARIANCE_MINUTES,
+        
+        -- Flag for aggregation (UPDATED LOGIC: -15 min to < 5 min)
+        CASE 
+            -- Rule 1: Must be >= -15 (Handles the ""12:44 is too early"" rule)
+            -- Rule 2: Must be < 5 (Handles the ""1:05 is late"" rule)
+            WHEN TIMEDIFF(MINUTE, s.SCHEDULE_START_LOCALIZED, t.SHIFT_START_LOCAL) >= -15 
+             AND TIMEDIFF(MINUTE, s.SCHEDULE_START_LOCALIZED, t.SHIFT_START_LOCAL) < 5 
+            THEN 1 
+            ELSE 0 
+        END AS COMPLIANCE_FLAG
+        
+    FROM schedules_clean s
+    INNER JOIN shifts_clean t 
+        ON s.wf_id = t.wf_id AND s.SCHEDULE_DATE = t.SHIFT_DATE
+    WHERE s.schedule_rank = 1 AND t.shift_rank = 1
+),
+
+monthly_aggregation AS (
+  ---monthly total + 75% logic + Individual Compliance Calculation
+    SELECT
+        d.wf_id,
+        d.SHIFT_MONTH,
+        SUM(d.SHIFT_DURATION_HOURS) AS TOTAL_WORKED_HOURS_MONTHLY,
+        MAX(c.PREFERRED_HOURS_MONTHLY) AS MONTHLY_CONTRACT_TARGET,
+        
+        -- Fulfillment Pct
+        CASE 
+            WHEN MAX(c.PREFERRED_HOURS_MONTHLY) IS NULL OR MAX(c.PREFERRED_HOURS_MONTHLY) = 0 THEN 0
+            ELSE (SUM(d.SHIFT_DURATION_HOURS) / MAX(c.PREFERRED_HOURS_MONTHLY)) * 100.0
+        END AS FULFILLMENT_PCT,
+        
+        -- Individual Compliance Score
+        (SUM(d.COMPLIANCE_FLAG) / COUNT(d.SHIFT_ID)) * 100.0 AS INDIVIDUAL_COMPLIANCE_SCORE,
+        
+        -- Count of compliant vs late shifts per user
+        SUM(d.COMPLIANCE_FLAG) AS COUNT_COMPLIANT_SHIFTS,
+        SUM(CASE WHEN d.COMPLIANCE_FLAG = 0 THEN 1 ELSE 0 END) AS COUNT_NON_COMPLIANT_SHIFTS
+        
+    FROM joined_daily_data d
+    LEFT JOIN employee_contracts c ON d.wf_id = c.wf_id
+    GROUP BY 1, 2
+),
+
+warehouse_stats AS (
+    -- Warehouse Level Compliance (Aggregated independently)
+    SELECT 
+        WAREHOUSE_NAME,
+        SHIFT_MONTH,
+        (SUM(COMPLIANCE_FLAG) / COUNT(*)) * 100.0 AS WAREHOUSE_COMPLIANCE_SCORE
+    FROM joined_daily_data
+    GROUP BY 1, 2
+)
+
+--- Final Output (DE-AGGREGATED)
+SELECT 
+    ec.EMAIL_ADDRESS,
+    base.wf_id,
+    base.job_title,
+    base.COUNTRY,
+    base.CITY,
+    base.WAREHOUSE_NAME,
+    base.EMPLOYMENT_TYPE,
+    base.TEAM_NAME,
+    base.SHIFT_MONTH,
+    
+    -- *** RAW SHIFT DATA ***
+    base.SCHEDULE_DATE,
+    base.SCHEDULE_START_LOCALIZED,
+    base.SHIFT_START_LOCAL,
+    base.START_VARIANCE_MINUTES, -- (Positive = Late, Negative = Early)
+    
+    -- Daily Flags
+    base.COMPLIANCE_FLAG AS IS_SHIFT_COMPLIANT, -- 1 = Yes, 0 = No
+    CASE 
+        WHEN base.COMPLIANCE_FLAG = 0 THEN 'NON_COMPLIANT' 
+        ELSE 'COMPLIANT' 
+    END AS SHIFT_STATUS_LABEL,
+    
+    -- *** AGGREGATED CONTEXT (Repeated per row) ***
+    ROUND(agg.FULFILLMENT_PCT, 2) AS MONTHLY_PCT_HOURS_WORKED,
+    CASE WHEN agg.FULFILLMENT_PCT >= 75 THEN 'ELIGIBLE' ELSE 'NOT_ELIGIBLE' END AS MONTHLY_CONTRACT_STATUS,
+    
+    ROUND(agg.INDIVIDUAL_COMPLIANCE_SCORE, 2) AS MONTHLY_INDIVIDUAL_COMPLIANCE_SCORE,
+    agg.COUNT_COMPLIANT_SHIFTS AS TOTAL_COMPLIANT_SHIFTS_MONTHLY,
+    agg.COUNT_NON_COMPLIANT_SHIFTS AS TOTAL_NON_COMPLIANT_SHIFTS_MONTHLY,
+    
+    ROUND(wh.WAREHOUSE_COMPLIANCE_SCORE, 2) AS WAREHOUSE_AVG_COMPLIANCE_SCORE
+
+FROM joined_daily_data base
+INNER JOIN employee_contracts ec 
+    ON base.wf_id = ec.wf_id
+INNER JOIN monthly_aggregation agg 
+    ON base.wf_id = agg.wf_id 
+    AND base.SHIFT_MONTH = agg.SHIFT_MONTH
+LEFT JOIN warehouse_stats wh
+    ON base.WAREHOUSE_NAME = wh.WAREHOUSE_NAME
+    AND base.SHIFT_MONTH = wh.SHIFT_MONTH
+
+WHERE agg.FULFILLMENT_PCT >= 75 -- Keeps filter for eligible employees only
+
+ORDER BY base.COUNTRY, base.wf_id, base.SCHEDULE_DATE;
