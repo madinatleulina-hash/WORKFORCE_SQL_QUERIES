@@ -1,5 +1,6 @@
 WITH employee_contracts AS (
-    -- get weekly contract hours and calculate monthly target
+    --     -- get weekly contract hours and calculate monthly target/ FSPM probably already has some logic in place. Ignore in this case
+
     SELECT 
         WF_ID, 
         EMAIL_ADDRESS,
@@ -55,8 +56,8 @@ joined_daily_data AS (
         
         -- Flag for aggregation (UPDATED LOGIC: -15 min to < 5 min)
         CASE 
-            -- Rule 1: Must be >= -15 (Handles the ""12:44 is too early"" rule)
-            -- Rule 2: Must be < 5 (Handles the ""1:05 is late"" rule)
+            -- Rule 1: Must be >= -15 (Handles the 12:44 is too early" rule). This is an internal decision.
+            -- Rule 2: Must be < 5 (Handles the 1:05 is late" rule). This is equal to the smart rounding in Workforce
             WHEN TIMEDIFF(MINUTE, s.SCHEDULE_START_LOCALIZED, t.SHIFT_START_LOCAL) >= -15 
              AND TIMEDIFF(MINUTE, s.SCHEDULE_START_LOCALIZED, t.SHIFT_START_LOCAL) < 5 
             THEN 1 
