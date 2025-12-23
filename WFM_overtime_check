@@ -1,0 +1,86 @@
+WITH DATE_RANGE AS (
+    -- Filter for the last calendar month (e.g., if running in Dec, gets Full Nov 1st - Nov 30th)
+    SELECT 
+        DATE_TRUNC('MONTH', DATEADD('MONTH', -1, CURRENT_DATE())) AS START_DATE,
+        DATE_TRUNC('MONTH', CURRENT_DATE()) AS END_DATE
+),
+
+RAW_DATA AS (
+    SELECT 
+        e.EMAIL_ADDRESS,
+        e.COUNTRY,
+        e.WAREHOUSE_NAME AS WAREHOUSE,
+        e.PREFERRED_HOURS,
+        
+        t.TIMESHEET_ID,
+        t.SHIFT_DATE,
+        t.SHIFT_ID,
+        
+        t.N_HOURS::FLOAT AS N_HOURS,
+        t.SHIFT_STATUS,
+        t.STATUS AS TIMESHEET_STATUS,
+        t.PAY_LEAVE_TYPE,
+
+        -- Calculate the daily worked hours for this shift and broadcast it to all rows of the shift
+        MAX(CASE WHEN t.PAY_LEAVE_TYPE = 'Worked Hours' THEN t.N_HOURS::FLOAT ELSE NULL END) 
+            OVER (PARTITION BY t.SHIFT_ID) AS WORKED_HOURS_TOTAL
+
+    FROM model.workforce.workforce_timesheets t
+    LEFT JOIN MART.WORKFORCE.EMPLOYEE e 
+        ON t.USER_ID = e.WF_ID
+
+    WHERE t.SHIFT_DATE >= (SELECT START_DATE FROM DATE_RANGE)
+      AND t.SHIFT_DATE < (SELECT END_DATE FROM DATE_RANGE)
+),
+
+WEEKLY_AGG AS (
+    -- Calculate the sum of unique daily worked hours per timesheet (week)
+    SELECT 
+        TIMESHEET_ID,
+        SUM(WORKED_HOURS_TOTAL) AS WEEKLY_WORKED_HOURS
+    FROM (
+        -- Get unique shift values to avoid double counting due to pay types
+        SELECT DISTINCT 
+            TIMESHEET_ID, 
+            SHIFT_ID, 
+            WORKED_HOURS_TOTAL 
+        FROM RAW_DATA
+        WHERE WORKED_HOURS_TOTAL IS NOT NULL
+    )
+    GROUP BY TIMESHEET_ID
+)
+
+SELECT 
+    r.EMAIL_ADDRESS,
+    r.COUNTRY,
+    r.WAREHOUSE,
+    r.PREFERRED_HOURS,
+    
+    r.TIMESHEET_ID,
+    r.SHIFT_DATE,
+    r.SHIFT_ID,
+    
+    r.WORKED_HOURS_TOTAL AS WORKED_HOURS, -- Daily worked hours
+    w.WEEKLY_WORKED_HOURS,                -- Sum of worked hours for the timesheet (week)
+    
+    r.N_HOURS,
+    r.SHIFT_STATUS,
+    r.TIMESHEET_STATUS,
+    r.PAY_LEAVE_TYPE,
+    
+    -- Difference (Preferred - Weekly Actuals)
+    ZEROIFNULL(r.PREFERRED_HOURS) - ZEROIFNULL(w.WEEKLY_WORKED_HOURS) AS WEEKLY_DIFFERENCE
+
+FROM RAW_DATA r
+LEFT JOIN WEEKLY_AGG w 
+    ON r.TIMESHEET_ID = w.TIMESHEET_ID
+
+WHERE r.PAY_LEAVE_TYPE != 'Worked Hours' 
+  -- Only show records where the Weekly Difference is negative (Actual > Preferred)
+  AND (ZEROIFNULL(r.PREFERRED_HOURS) - ZEROIFNULL(w.WEEKLY_WORKED_HOURS)) < 0
+
+ORDER BY 
+    r.COUNTRY, 
+    r.WAREHOUSE, 
+    r.EMAIL_ADDRESS, 
+    r.SHIFT_DATE;
