@@ -1,0 +1,67 @@
+---query needs employment tab from Hibob, otherwise xlookup with csv
+
+WITH calendar_context AS (
+  SELECT
+    CURRENT_DATE AS today,
+    DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '1 day' AS last_day_prev_month,
+    DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '1 month' AS first_day_prev_month
+),
+week_check AS (
+  SELECT
+    DATE_TRUNC('week', last_day_prev_month) AS last_week_monday,
+    last_day_prev_month
+  FROM calendar_context
+),
+start_and_end_dates AS (
+  SELECT
+    -- Start: Monday of the first week that includes any previous-month date
+    DATE_TRUNC('week', c.first_day_prev_month) AS start_date,
+
+    -- End: If the last week's Sunday is in the same month, keep it; else, go back 1 week
+    CASE
+      WHEN MONTH(DATEADD(day, 6, w.last_week_monday)) = MONTH(w.last_day_prev_month)
+        THEN DATEADD(day, 6, w.last_week_monday)
+      ELSE DATEADD(day, 6, DATEADD(week, -1, w.last_week_monday))
+    END AS end_date
+  FROM calendar_context c
+  JOIN week_check w ON TRUE
+)
+
+SELECT
+  -- New fields from HIBOB
+  h.EMAIL,
+ 
+    p.WORKING_DATE,
+
+  -- Existing fields from PAYROLL (Explicitly selecting p.EMPLOYEE_NAME as "Name")
+  p.EMPLOYEE_NAME,
+  p.COUNTRY, h.WEEKLY_HOURS,
+  p.TEAM_COST_CENTER,
+  p.PAYROLL_ID,
+  p.WF_ID,
+  p.PAY_LEAVE_TYPE,
+  p.STATUS,
+  p.N_HOURS,
+  p.MAX_INSERTED_TIMESTAMP,
+  p._KEY
+FROM
+  MART.WORKFORCE.PAYROLL p
+JOIN
+  MART.HIBOB.MART_HIBOB h ON p.EMAIL_address = h.EMAIL
+WHERE
+  p.WORKING_DATE BETWEEN (SELECT start_date FROM start_and_end_dates) AND (SELECT end_date FROM start_and_end_dates)
+  -- Leave type exclusions
+  AND (p.PAY_LEAVE_TYPE <> 'Sunday' OR p.PAY_LEAVE_TYPE IS NULL)
+  AND (p.PAY_LEAVE_TYPE <> 'Night' OR p.PAY_LEAVE_TYPE IS NULL)
+  AND (p.PAY_LEAVE_TYPE <> 'Public Holiday' OR p.PAY_LEAVE_TYPE IS NULL)
+  AND (p.PAY_LEAVE_TYPE <> 'Unpaid Vacation' OR p.PAY_LEAVE_TYPE IS NULL)
+  AND (p.PAY_LEAVE_TYPE <> 'Unauthorised Absence' OR p.PAY_LEAVE_TYPE IS NULL)
+  AND (p.PAY_LEAVE_TYPE <> 'Temp Worker Leave' OR p.PAY_LEAVE_TYPE IS NULL)
+  AND (p.PAY_LEAVE_TYPE <> 'Parental Leave (Paid)' OR p.PAY_LEAVE_TYPE IS NULL)
+  AND (p.PAY_LEAVE_TYPE <> 'Parental Leave (Unpaid)' OR p.PAY_LEAVE_TYPE IS NULL)
+  AND (p.PAY_LEAVE_TYPE <> 'Suspended' OR p.PAY_LEAVE_TYPE IS NULL)
+  
+  -- New Filters: Country and Weekly Hours
+  AND h.COUNTRY = 'UK'
+  AND h.WEEKLY_HOURS < 37.5
+order by email, WORKING_DATE asc
