@@ -1,0 +1,31 @@
+SELECT DISTINCT
+    t.COUNTRY,
+    t.USER_ID,
+    u.USER_NAME,
+    t.TIMESHEET_ID,
+    t.SHIFT_DATE,
+    t.SHIFT_START,
+    t.SHIFT_FINISH,
+    t.PAY_LEAVE_TYPE AS "timesheet leave type",
+    t.NAME_IN_WF,
+    t.N_HOURS AS "hours",
+    l.LEAVE_TYPE,
+    l.LEAVE_NR_HOURS AS "leave nr of hours"
+FROM 
+    MODEL.WORKFORCE.WORKFORCE_TIMESHEETS t
+LEFT JOIN 
+    MODEL.WORKFORCE.WORKFORCE_USERS u
+    ON t.USER_ID = u.USER_ID
+LEFT JOIN 
+    MODEL.WORKFORCE.WORKFORCE_LEAVES l 
+    ON t.USER_ID = l.LEAVE_USER_ID 
+    AND t.SHIFT_DATE BETWEEN TO_DATE(l.LEAVE_START) AND TO_DATE(l.LEAVE_FINISH)
+    AND l.COUNTRY = 'UK'
+WHERE 
+    t.SHIFT_DATE BETWEEN '2025-12-01' AND '2025-12-31'
+    AND t.COUNTRY = 'UK'
+    -- Logic to catch the bug: Name says vacation, but no leave attached
+    AND (t.NAME_IN_WF ILIKE '%Vacation%' OR t.PAY_LEAVE_TYPE ILIKE '%Vacation%')
+    AND l.LEAVE_TYPE IS NULL
+ORDER BY 
+    t.SHIFT_DATE, t.USER_ID;
