@@ -1,0 +1,13 @@
+SELECT 
+    -- Select all columns from HIBOB, excluding salary fields
+    h.* EXCLUDE (BASE_SALARY, SALARY_PAY_PERIOD),
+    -- Select all columns from Work History, excluding payroll ID
+    wh.* EXCLUDE (PAYROLL_ENTRY_ID)
+FROM MODEL_CONFIDENTIAL.HIBOB.HIBOB h
+JOIN MART.HIBOB.WORK_HISTORY wh 
+    ON h.EMAIL = wh.EMAIL
+WHERE 
+    -- Filter for active employees:
+    -- 1. Termination date is NULL (Employee is indefinitely active)
+    -- 2. OR Termination date is in the future (Employee is leaving but still active today)
+    (h.TERMINATION_DATE IS NULL OR h.TERMINATION_DATE > CURRENT_DATE());
