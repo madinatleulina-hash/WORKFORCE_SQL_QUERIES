@@ -1,0 +1,6 @@
+=IF(AND(L2="", M2=""), "Match (Blank)", 
+  IF(OR(L2="", M2=""), "Mismatch",
+    IF(JOIN(",", SORT(TRANSPOSE(TRIM(SPLIT(L2, ","))))) = JOIN(",", SORT(TRANSPOSE(TRIM(SPLIT(M2, ","))))), 
+    "Match", "Mismatch")
+  )
+)
