@@ -1,0 +1,298 @@
+WITH History_Sorted AS (
+    SELECT 
+        EMAIL, VALID_FROM, JOB_TITLE, SALARY_PAY_TYPE, EMPLOYMENT_TYPE,
+        LAG(JOB_TITLE) OVER (PARTITION BY EMAIL ORDER BY VALID_FROM) as prev_job,
+        LAG(SALARY_PAY_TYPE) OVER (PARTITION BY EMAIL ORDER BY VALID_FROM) as prev_salary,
+        LAG(EMPLOYMENT_TYPE) OVER (PARTITION BY EMAIL ORDER BY VALID_FROM) as prev_emp_type
+    FROM MART.HIBOB.WORK_HISTORY
+),
+Change_Events AS (
+    SELECT 
+        EMAIL, VALID_FROM,
+        CASE WHEN JOB_TITLE != prev_job OR prev_job IS NULL THEN VALID_FROM END as job_change_date,
+        CASE WHEN SALARY_PAY_TYPE != prev_salary OR prev_salary IS NULL THEN VALID_FROM END as salary_change_date,
+        CASE WHEN EMPLOYMENT_TYPE != prev_emp_type OR prev_emp_type IS NULL THEN VALID_FROM END as emp_type_change_date
+    FROM History_Sorted
+),
+Latest_Changes AS (
+    SELECT 
+        EMAIL,
+        MAX(job_change_date)::DATE as hb_LATEST_JOB_CHANGE_DATE,
+        MAX(salary_change_date)::DATE as hb_LATEST_SALARY_CHANGE_DATE,
+        MAX(emp_type_change_date)::DATE as hb_LATEST_EMP_TYPE_CHANGE_DATE
+    FROM Change_Events
+    GROUP BY EMAIL
+),
+Active_Workforce AS (
+    -- 1. Filter Workforce for Active Employees only
+    SELECT 
+        EMAIL_ADDRESS, 
+        AWARD_TAG_NAME
+    FROM MART.WORKFORCE.EMPLOYEE
+    WHERE IS_ACTIVE = TRUE
+),
+Base_Population AS (
+    SELECT 
+        h.COUNTRY,
+        h.EMAIL,
+        h.DISPLAY_NAME,
+        h.JOB_TITLE,
+        h.EMPLOYMENT_TYPE,
+        h.COST_CENTRE,
+        h.SALARY_PAY_TYPE,
+        h.IS_ELIGIBLE_FOR_OVERTIME,
+        h.IS_ELIGIBLE_FOR_INCONVENIENT_WORKING_HOURS,
+        
+        -- Existing Tags from Active Workforce
+        w.AWARD_TAG_NAME AS EXISTING_TAGS,
+        
+        lc.hb_LATEST_JOB_CHANGE_DATE,
+        lc.hb_LATEST_SALARY_CHANGE_DATE,
+        lc.hb_LATEST_EMP_TYPE_CHANGE_DATE
+    FROM MODEL_CONFIDENTIAL.HIBOB.HIBOB h
+    -- 2. INNER JOIN ensures we ONLY get employees who are in the Active Workforce list
+    INNER JOIN Active_Workforce w ON h.EMAIL = w.EMAIL_ADDRESS
+    LEFT JOIN Latest_Changes lc ON h.EMAIL = lc.EMAIL
+),
+/* ==========================================================================
+   COUNTRY LOGIC MODULES
+   ========================================================================== */
+Germany_Logic AS (
+    SELECT *,
+        CASE 
+            WHEN JOB_TITLE ILIKE 'Site Manager' THEN 
+                'SM' || ', ' || CASE WHEN SALARY_PAY_TYPE ILIKE 'Salaried' THEN 'Monthly' WHEN SALARY_PAY_TYPE ILIKE 'Hourly' THEN 'Hourly' ELSE 'ERROR' END
+            WHEN EMPLOYMENT_TYPE ILIKE '%Temp Worker%' THEN 'Temp'
+            WHEN JOB_TITLE IN ('Fleet Manager', 'Head of Fleet Management', 'Senior Fleet Manager') THEN ''
+            WHEN JOB_TITLE IN ('Street Patrol', 'Street Patrol Team Lead', 'Mobile Vehicle Mechanic', 'Mobile Vehicle Mechanic Team Lead')
+                 AND EMPLOYMENT_TYPE IN ('Fixed term - minijob (Germany only)', 'Fixed term - student (Germany only)') THEN 
+                'FSTL-Remote, NOIH' || ', ' || CASE WHEN SALARY_PAY_TYPE ILIKE 'Salaried' THEN 'Monthly' WHEN SALARY_PAY_TYPE ILIKE 'Hourly' THEN 'Hourly' ELSE 'ERROR' END
+            WHEN JOB_TITLE IN ('Street Patrol', 'Street Patrol Team Lead', 'Mobile Vehicle Mechanic', 'Mobile Vehicle Mechanic Team Lead') THEN 
+                'FSTL-Remote' || ', ' || CASE WHEN SALARY_PAY_TYPE ILIKE 'Salaried' THEN 'Monthly' WHEN SALARY_PAY_TYPE ILIKE 'Hourly' THEN 'Hourly' ELSE 'ERROR' END
+            WHEN (COST_CENTRE LIKE '%410%' OR COST_CENTRE LIKE '%360%')
+                 AND EMPLOYMENT_TYPE NOT IN ('Fixed term - minijob (Germany only)', 'Fixed term - student (Germany only)') THEN 
+                'FSTL' || ', ' || CASE WHEN SALARY_PAY_TYPE ILIKE 'Salaried' THEN 'Monthly' WHEN SALARY_PAY_TYPE ILIKE 'Hourly' THEN 'Hourly' ELSE 'ERROR' END
+            WHEN (COST_CENTRE LIKE '%410%' OR COST_CENTRE LIKE '%360%')
+                 AND EMPLOYMENT_TYPE IN ('Fixed term - minijob (Germany only)', 'Fixed term - student (Germany only)') THEN 
+                'FSTL, NOIH' || ', ' || CASE WHEN SALARY_PAY_TYPE ILIKE 'Salaried' THEN 'Monthly' WHEN SALARY_PAY_TYPE ILIKE 'Hourly' THEN 'Hourly' ELSE 'ERROR' END
+            ELSE 'ERROR'
+        END AS GENERATED_TAGS
+    FROM Base_Population WHERE COUNTRY = 'Germany'
+),
+
+Sweden_Logic AS (
+    SELECT *,
+        CASE 
+            WHEN COST_CENTRE NOT LIKE '%360%' AND COST_CENTRE NOT LIKE '%410%' THEN ''
+            WHEN EMPLOYMENT_TYPE ILIKE 'Temp worker' THEN 'Temp'
+            WHEN IS_ELIGIBLE_FOR_OVERTIME = TRUE AND IS_ELIGIBLE_FOR_INCONVENIENT_WORKING_HOURS = TRUE AND SALARY_PAY_TYPE ILIKE 'Salaried' THEN 'S-OTN'
+            WHEN IS_ELIGIBLE_FOR_OVERTIME = TRUE AND IS_ELIGIBLE_FOR_INCONVENIENT_WORKING_HOURS = TRUE AND SALARY_PAY_TYPE ILIKE 'Hourly' THEN 'H-OTN'
+            WHEN IS_ELIGIBLE_FOR_OVERTIME = FALSE AND IS_ELIGIBLE_FOR_INCONVENIENT_WORKING_HOURS = FALSE AND SALARY_PAY_TYPE ILIKE 'Hourly' THEN 'H-NOTN'
+            WHEN IS_ELIGIBLE_FOR_OVERTIME = FALSE AND IS_ELIGIBLE_FOR_INCONVENIENT_WORKING_HOURS = FALSE AND SALARY_PAY_TYPE ILIKE 'Salaried' THEN 'S-NOTN'
+            ELSE ''
+        END AS GENERATED_TAGS
+    FROM Base_Population WHERE COUNTRY = 'Sweden'
+),
+
+UK_Logic AS (
+    SELECT *,
+        CASE 
+            WHEN EMPLOYMENT_TYPE ILIKE '%Temp worker%' THEN 'Temp'
+            WHEN JOB_TITLE IN ('Fleet Specialist Team Lead', 'Shift Supervisor', 'Senior Fleet Specialist Team Lead', 'Vehicle Mechanic Team Lead') THEN 
+                'TL-OIH' || ', ' || 
+                (CASE WHEN SALARY_PAY_TYPE ILIKE 'Salaried' THEN 'Monthly' WHEN SALARY_PAY_TYPE ILIKE 'Hourly' THEN 'Hourly' ELSE 'ERROR' END) ||
+                (CASE WHEN EMPLOYMENT_TYPE ILIKE '%Fixed Term%' THEN ', Fixed Term' ELSE '' END)
+            WHEN (COST_CENTRE LIKE '%410%' OR COST_CENTRE LIKE '%360%') THEN 
+                'FS-OIH' || ', ' || 
+                (CASE WHEN SALARY_PAY_TYPE ILIKE 'Salaried' THEN 'Monthly' WHEN SALARY_PAY_TYPE ILIKE 'Hourly' THEN 'Hourly' ELSE 'ERROR' END) ||
+                (CASE WHEN EMPLOYMENT_TYPE ILIKE '%Fixed Term%' THEN ', Fixed Term' ELSE '' END)
+            ELSE ''
+        END AS GENERATED_TAGS
+    FROM Base_Population 
+    WHERE COUNTRY IN ('UK', 'United Kingdom') 
+),
+
+Denmark_Logic AS (
+    SELECT *,
+        CASE 
+            WHEN EMPLOYMENT_TYPE ILIKE '%Temp worker%' THEN 'Temp'
+            WHEN JOB_TITLE IN ('Fleet Specialist Team Lead', 'Shift Supervisor', 'Site Manager') 
+                 AND SALARY_PAY_TYPE ILIKE 'Salaried' THEN 'TLSM-Monthly'
+            WHEN JOB_TITLE IN ('Fleet Specialist Team Lead', 'Shift Supervisor', 'Site Manager') 
+                 AND SALARY_PAY_TYPE ILIKE 'Hourly' THEN 'TLSM-Hourly'
+            WHEN JOB_TITLE NOT IN ('Fleet Specialist Team Lead', 'Shift Supervisor', 'Site Manager', 'Fleet Manager', 'Fleet Manager Lead') 
+                 AND SALARY_PAY_TYPE ILIKE 'Salaried' THEN 'FS-Monthly'
+            WHEN JOB_TITLE NOT IN ('Fleet Specialist Team Lead', 'Shift Supervisor', 'Site Manager', 'Fleet Manager', 'Fleet Manager Lead') 
+                 AND SALARY_PAY_TYPE ILIKE 'Hourly' THEN 'FS-Hourly'
+            ELSE ''
+        END AS GENERATED_TAGS
+    FROM Base_Population WHERE COUNTRY = 'Denmark'
+),
+
+Spain_Logic AS (
+    SELECT *,
+        CASE 
+            WHEN EMPLOYMENT_TYPE ILIKE '%Temp worker%' THEN 'Temp'
+            WHEN SALARY_PAY_TYPE ILIKE 'Salaried' THEN 'Monthly'
+            WHEN SALARY_PAY_TYPE ILIKE 'Hourly' THEN 'Hourly'
+            ELSE ''
+        END AS GENERATED_TAGS
+    FROM Base_Population WHERE COUNTRY = 'Spain'
+),
+
+Switzerland_Logic AS (
+    SELECT *,
+        CASE 
+            WHEN EMPLOYMENT_TYPE ILIKE '%Temp worker%' THEN 'Temp'
+            WHEN SALARY_PAY_TYPE ILIKE 'Salaried' AND JOB_TITLE NOT ILIKE 'Fleet Manager' THEN 'FS/TL/SM - Monthly'
+            WHEN SALARY_PAY_TYPE ILIKE 'Hourly' THEN 'FS/TL/SM - Hourly'
+            ELSE ''
+        END AS GENERATED_TAGS
+    FROM Base_Population WHERE COUNTRY = 'Switzerland'
+),
+
+Austria_Logic AS (
+    SELECT *,
+        CASE 
+            WHEN EMPLOYMENT_TYPE ILIKE '%Temp worker%' THEN 'Temp'
+            WHEN SALARY_PAY_TYPE ILIKE 'Salaried' AND JOB_TITLE NOT ILIKE 'Fleet Manager' THEN 'FS/TL/SM - Monthly'
+            WHEN SALARY_PAY_TYPE ILIKE 'Hourly' THEN 'FS/TL/SM - Hourly'
+            ELSE ''
+        END AS GENERATED_TAGS
+    FROM Base_Population WHERE COUNTRY = 'Austria'
+),
+
+Norway_Logic AS (
+    SELECT *,
+        CASE 
+            WHEN IS_ELIGIBLE_FOR_OVERTIME = TRUE AND IS_ELIGIBLE_FOR_INCONVENIENT_WORKING_HOURS = TRUE AND SALARY_PAY_TYPE ILIKE 'Salaried' THEN 'S-OTN'
+            WHEN IS_ELIGIBLE_FOR_OVERTIME = TRUE AND IS_ELIGIBLE_FOR_INCONVENIENT_WORKING_HOURS = TRUE AND SALARY_PAY_TYPE ILIKE 'Hourly' THEN 'H-OTN'
+            WHEN IS_ELIGIBLE_FOR_OVERTIME = FALSE AND IS_ELIGIBLE_FOR_INCONVENIENT_WORKING_HOURS = FALSE AND SALARY_PAY_TYPE ILIKE 'Hourly' THEN 'H-NOTN'
+            WHEN IS_ELIGIBLE_FOR_OVERTIME = FALSE AND IS_ELIGIBLE_FOR_INCONVENIENT_WORKING_HOURS = FALSE AND SALARY_PAY_TYPE ILIKE 'Salaried' THEN 'S-NOTN'
+            WHEN EMPLOYMENT_TYPE ILIKE '%Temp Worker%' THEN 'Temp'
+            ELSE 'ERROR'
+        END AS GENERATED_TAGS
+    FROM Base_Population WHERE COUNTRY = 'Norway'
+),
+
+Finland_Logic AS (
+    SELECT *,
+        CASE 
+            WHEN EMPLOYMENT_TYPE ILIKE '%Temp worker%' THEN 'Temp'
+            WHEN IS_ELIGIBLE_FOR_OVERTIME = TRUE AND IS_ELIGIBLE_FOR_INCONVENIENT_WORKING_HOURS = TRUE AND SALARY_PAY_TYPE ILIKE 'Salaried' THEN 'S-OTN'
+            WHEN IS_ELIGIBLE_FOR_OVERTIME = TRUE AND IS_ELIGIBLE_FOR_INCONVENIENT_WORKING_HOURS = TRUE AND SALARY_PAY_TYPE ILIKE 'Hourly' THEN 'H-OTN'
+            WHEN IS_ELIGIBLE_FOR_OVERTIME = FALSE AND IS_ELIGIBLE_FOR_INCONVENIENT_WORKING_HOURS = FALSE AND SALARY_PAY_TYPE ILIKE 'Hourly' THEN 'H-NOTN'
+            WHEN IS_ELIGIBLE_FOR_OVERTIME = FALSE AND IS_ELIGIBLE_FOR_INCONVENIENT_WORKING_HOURS = FALSE AND SALARY_PAY_TYPE ILIKE 'Salaried' THEN 'S-NOTN'
+            ELSE 'ERROR'
+        END AS GENERATED_TAGS
+    FROM Base_Population WHERE COUNTRY = 'Finland'
+),
+
+France_Logic AS (
+    SELECT *,
+        (
+            CASE 
+                WHEN EMPLOYMENT_TYPE ILIKE '%Temp Worker%' THEN 'Temp'
+                WHEN JOB_TITLE ILIKE 'Site Manager' THEN ''
+                WHEN SALARY_PAY_TYPE ILIKE 'Salaried' THEN 'FSTL-Monthly'
+                WHEN SALARY_PAY_TYPE ILIKE 'Hourly' THEN 'FSTL-Hourly'
+                ELSE ''
+            END
+        ) || 
+        (
+            CASE 
+                WHEN LOWER(DISPLAY_NAME) IN ('thomas guilleret', 'mohamed billel benchabane', 'mohamed yacine gueddoura', 'eric battestini', 'mohamed amin bliou', 'frédéric bruno', 'ramzi boulaabi', 'david capron', 'fouad tabet') THEN ', RTT'
+                ELSE ''
+            END
+        ) AS GENERATED_TAGS
+    FROM Base_Population WHERE COUNTRY = 'France'
+),
+
+Belgium_Logic AS (
+    SELECT *,
+        CASE 
+            WHEN EMPLOYMENT_TYPE ILIKE '%Temp worker%' THEN 'Temp'
+            WHEN JOB_TITLE IN ('Fleet Specialist Team Lead', 'Interim Site Manager', 'Site Manager') THEN 'TL-Monthly'
+            WHEN SALARY_PAY_TYPE ILIKE 'Salaried' THEN 'FS-Monthly'
+            WHEN SALARY_PAY_TYPE ILIKE 'Hourly' THEN 'FS-Hourly'
+            ELSE ''
+        END AS GENERATED_TAGS
+    FROM Base_Population WHERE COUNTRY = 'Belgium'
+),
+
+Italy_Logic AS (
+    SELECT *,
+        CASE 
+            -- 1. Temp Workers
+            WHEN EMPLOYMENT_TYPE ILIKE '%Temp worker%' THEN 'Temp'
+            
+            -- 2. Salaried Staff
+            WHEN SALARY_PAY_TYPE ILIKE 'Salaried' THEN 'FSTL-Monthly'
+            
+            -- 3. Hourly Staff
+            WHEN SALARY_PAY_TYPE ILIKE 'Hourly' THEN 'FSTL-Hourly'
+            
+            -- Fallback
+            ELSE ''
+        END AS GENERATED_TAGS
+    FROM Base_Population WHERE COUNTRY = 'Italy'
+),
+
+Other_Countries AS (
+    SELECT *, NULL AS GENERATED_TAGS 
+    FROM Base_Population 
+    WHERE COUNTRY NOT IN ('Germany', 'Sweden', 'UK', 'United Kingdom', 'Denmark', 'Spain', 'Switzerland', 'Austria', 'Norway', 'Finland', 'France', 'Belgium', 'Italy')
+),
+
+Combined_Results AS (
+    SELECT * FROM Germany_Logic
+    UNION ALL SELECT * FROM Sweden_Logic
+    UNION ALL SELECT * FROM UK_Logic
+    UNION ALL SELECT * FROM Denmark_Logic
+    UNION ALL SELECT * FROM Spain_Logic
+    UNION ALL SELECT * FROM Switzerland_Logic
+    UNION ALL SELECT * FROM Austria_Logic
+    UNION ALL SELECT * FROM Norway_Logic
+    UNION ALL SELECT * FROM Finland_Logic
+    UNION ALL SELECT * FROM France_Logic
+    UNION ALL SELECT * FROM Belgium_Logic
+    UNION ALL SELECT * FROM Italy_Logic
+    UNION ALL SELECT * FROM Other_Countries
+)
+
+/* ==========================================================================
+   FINAL OUTPUT
+   ========================================================================== */
+SELECT 
+    COUNTRY,
+    EMAIL,
+    EMPLOYMENT_TYPE,
+    JOB_TITLE,
+    SALARY_PAY_TYPE,
+    COST_CENTRE,
+    
+    IS_ELIGIBLE_FOR_OVERTIME,
+    IS_ELIGIBLE_FOR_INCONVENIENT_WORKING_HOURS,
+    
+    hb_LATEST_JOB_CHANGE_DATE,
+    hb_LATEST_SALARY_CHANGE_DATE,
+    hb_LATEST_EMP_TYPE_CHANGE_DATE,
+
+    EXISTING_TAGS AS WF_EXISTING_TAGS,
+    GENERATED_TAGS,
+
+    CASE 
+        WHEN (GENERATED_TAGS IS NULL OR TRIM(GENERATED_TAGS) = '') 
+             AND (EXISTING_TAGS IS NULL OR TRIM(EXISTING_TAGS) = '') THEN 'Match (Blank)'
+             
+        WHEN (GENERATED_TAGS IS NULL OR TRIM(GENERATED_TAGS) = '') 
+             OR (EXISTING_TAGS IS NULL OR TRIM(EXISTING_TAGS) = '') THEN 'Mismatch'
+             
+        WHEN ARRAY_SORT(SPLIT(REPLACE(GENERATED_TAGS, ' ', ''), ',')) 
+             = ARRAY_SORT(SPLIT(REPLACE(EXISTING_TAGS, ' ', ''), ',')) THEN 'Match'
+             
+        ELSE 'Mismatch'
+    END AS TAG_MATCH_STATUS
+
+FROM Combined_Results
+ORDER BY COUNTRY, EMAIL;
