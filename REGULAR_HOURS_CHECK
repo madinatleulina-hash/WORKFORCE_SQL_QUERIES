@@ -1,0 +1,65 @@
+WITH ACTIVE_USERS AS (
+    -- Filter for active users from the users table
+    SELECT 
+        USER_ID 
+    FROM MODEL.WORKFORCE.WORKFORCE_USERS
+    WHERE IS_ACTIVE = TRUE
+),
+
+RAW_WITH_DURATION AS (
+    -- Join regular hours with active users and calculate shift duration
+    SELECT 
+        rh.USER_NAME,
+        rh.EMAIL,
+        rh.WF_ID,
+        rh.COUNTRY,
+        rh.WEEK,
+        rh._INSERTED_TIMESTAMP,
+        -- Calculate difference in minutes. Adds 24 hours (1440 mins) if the shift crosses midnight.
+        CASE 
+            WHEN TO_TIME(rh.END_TIME) < TO_TIME(rh.START_TIME) THEN 
+                DATEDIFF(minute, TO_TIME(rh.START_TIME), TO_TIME(rh.END_TIME)) + 1440
+            ELSE 
+                DATEDIFF(minute, TO_TIME(rh.START_TIME), TO_TIME(rh.END_TIME))
+        END AS SHIFT_DURATION_MINUTES
+    FROM MART.WORKFORCE.REGULAR_HOURS rh
+    INNER JOIN ACTIVE_USERS u 
+        ON TO_VARCHAR(rh.WF_ID) = TO_VARCHAR(u.USER_ID)
+),
+
+WEEKLY_TOTALS AS (
+    -- Calculate the total minutes worked per week for each user
+    SELECT
+        WF_ID,
+        WEEK,
+        SUM(SHIFT_DURATION_MINUTES) as TOTAL_WEEKLY_MINUTES
+    FROM RAW_WITH_DURATION
+    GROUP BY WF_ID, WEEK
+),
+
+USER_CONSISTENCY_FLAG AS (
+    -- Check if the min and max weekly totals differ for a user
+    SELECT
+        WF_ID,
+        CASE 
+            WHEN MIN(TOTAL_WEEKLY_MINUTES) = MAX(TOTAL_WEEKLY_MINUTES) THEN 'same hours'
+            ELSE 'not same hours'
+        END AS HOURS_STATUS
+    FROM WEEKLY_TOTALS
+    GROUP BY WF_ID
+)
+
+-- Final Selection: One row per user with Max Week and Latest Timestamp
+SELECT r.country,
+    r.USER_NAME,
+    r.EMAIL,
+    r.WF_ID,
+    -- Calculate the max week number for this user (e.g., length of rotation)
+    MAX(r.WEEK) OVER (PARTITION BY r.WF_ID) as MAX_WEEK_IN_ROTATION,
+    -- Calculate the latest inserted timestamp for this user across all their records
+    MAX(r._INSERTED_TIMESTAMP) OVER (PARTITION BY r.WF_ID) as _INSERTED_TIMESTAMP,
+    f.HOURS_STATUS
+FROM RAW_WITH_DURATION r
+JOIN USER_CONSISTENCY_FLAG f 
+    ON r.WF_ID = f.WF_ID
+ORDER BY  r.user_name
