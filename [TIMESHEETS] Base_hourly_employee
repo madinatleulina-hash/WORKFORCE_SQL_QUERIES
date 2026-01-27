@@ -1,0 +1,98 @@
+"WITH location_mapping AS (
+    SELECT DISTINCT
+        location_id,
+        location_name,
+        country,
+        CASE
+            WHEN CONTAINS(location_name, 'oslo') THEN 'oslo'
+            ELSE location_name
+        END AS location_join
+    FROM model.workforce.workforce_locations
+),
+
+work_events_filter_pre AS (
+    SELECT DISTINCT
+        second_export_name AS work_event,
+        country
+    FROM mart.workforce.workforce_mapping
+    WHERE second_export_name IS NOT NULL
+),
+
+model_workforce_shifts AS (
+    SELECT
+        shifts_.timesheet_id,
+        shifts_.pay_leave_type,
+        CONCAT(
+            COALESCE(shifts_.timesheet_id, ','),
+            COALESCE(shifts_.pay_leave_type, ','),
+            COALESCE(shifts_.shift_id, ','),
+            COALESCE(TO_CHAR(shifts_.shift_event_start), ','),
+            COALESCE(TO_CHAR(shifts_.shift_event_finish), ',')
+        ) AS key_,
+        loc.country
+    FROM model.workforce.workforce_timesheets AS shifts_
+    INNER JOIN model.workforce.workforce_departments AS dept
+        ON shifts_.department_id = dept.department_id
+    INNER JOIN location_mapping AS loc
+        ON dept.location_id = loc.location_id
+    WHERE shifts_.timesheet_start::date >= '2025-01-01'
+        AND loc.location_join NOT IN ('office', 'x-testtown')
+),
+
+split_work_events AS (
+    SELECT
+        key_,
+        timesheet_id,
+        country,
+        TRIM(LTRIM(RTRIM(word.value, ' '), ' '), '""') AS work_event_split
+    FROM model_workforce_shifts,
+    LATERAL FLATTEN(input => SPLIT(pay_leave_type, '&')) AS word
+),
+
+flag_work_events AS (
+    SELECT
+        split_work_events.key_,
+        split_work_events.timesheet_id,
+        split_work_events.country,
+        split_work_events.work_event_split,
+        IFF(
+            wef.work_event IS NOT NULL
+            OR split_work_events.work_event_split IN ('Ordinary (H)', 'Ordinary (M)', 'Worked Hours'),
+            'keep',
+            'remove'
+        ) AS flag_work_event_split
+    FROM split_work_events
+    LEFT JOIN work_events_filter_pre AS wef
+        ON wef.work_event = split_work_events.work_event_split
+        AND wef.country = split_work_events.country
+),
+
+flag_work_events_rows AS (
+    SELECT 
+        timesheet_id,
+        country,
+        LISTAGG(flag_work_event_split, ',') WITHIN GROUP (ORDER BY work_event_split) AS combined_flags,
+        IFF(CONTAINS(combined_flags, 'remove'), 'remove', 'keep') AS flag_work_event
+    FROM flag_work_events
+    GROUP BY timesheet_id, country
+),
+
+employee_lookup AS (
+    SELECT
+        timesheet_id,
+        MIN(shift_date) AS start_date,
+        ANY_VALUE(employee_name) AS employee_name
+    FROM mart.workforce.shifts
+    GROUP BY timesheet_id
+)
+
+SELECT
+    f.timesheet_id,
+    f.country,
+    e.employee_name,
+    e.start_date
+FROM flag_work_events_rows AS f
+LEFT JOIN employee_lookup AS e
+    ON f.timesheet_id = e.timesheet_id
+WHERE f.flag_work_event = 'remove'
+ORDER BY f.country, f.timesheet_id;"
