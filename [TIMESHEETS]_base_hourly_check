@@ -1,0 +1,134 @@
+WITH location_mapping as (
+    select distinct
+        location_id,
+        location_name,
+        country,
+        case
+            when contains(location_name, 'oslo') then 'oslo'
+            else location_name
+        end as location_join
+    from model.workforce.workforce_locations
+),
+warehouse_mapping_pre as (
+    select distinct
+        warehouse_name,
+        city
+    from mart.warehouse.warehouse_mapping
+),
+warehouse_mapping as (
+    select distinct
+        case
+            when loc.location_join = 'monheim am rhein' then 'monheim (romerstrasse)'
+            else wh.warehouse_name
+        end as warehouse_name,
+        loc.location_join as city
+    from location_mapping as loc
+    left join warehouse_mapping_pre as wh
+        on wh.city = loc.location_join
+),
+work_events_filter_pre as (
+    select distinct
+        second_export_name as work_event,
+        country,
+        types as work_type,
+        category,
+        case
+            when rate = '-' then 0
+            when rate is null then 0
+            when lower(rate) like '%eur%' then 0
+            else try_cast(regexp_replace(rate, '[^0-9.]', '') as decimal(10, 2))
+        end as clean_rate
+    from lake_stitch.workforce_mapping.workforce_mapping --mart.workforce.workforce_mapping
+    where second_export_name is not null
+),
+work_events_filter as (
+    select
+        work_event,
+        country,
+        work_type,
+        category,
+        avg(clean_rate) as pay_rate
+    from work_events_filter_pre
+    group by all
+),
+model_workforce_shifts as (
+   select
+        shifts_.shift_date,
+        shifts_.n_hours,
+        shifts_.pay_leave_type,
+        concat(
+            COALESCE(shifts_.timesheet_id, ','),
+            COALESCE(shifts_.pay_leave_type, ','),
+            COALESCE(shifts_.shift_id, ','),
+            COALESCE(TO_CHAR(shifts_.shift_event_start), ','),
+            COALESCE(TO_CHAR(shifts_.shift_event_finish), ',')
+        ) as key_,
+        locations_.country
+    from model.workforce.workforce_timesheets as shifts_
+    inner join model.workforce.workforce_departments as departments_
+        on shifts_.department_id = departments_.department_id
+    inner join location_mapping as locations_
+        on departments_.location_id = locations_.location_id
+        and shifts_.timesheet_start::date >= '2025-01-01'
+        and locations_.location_join not in ('office', 'x-testtown')
+),
+split_work_events as (
+    select
+        key_,
+        country,
+        word.index as index_row,
+        trim(ltrim(rtrim(word.value, ' '), ' '), '""') as work_event_split
+    from model_workforce_shifts,
+    lateral flatten(input => split(pay_leave_type, '&')) as word
+),
+flag_work_events as (
+    select
+        iff(
+            filter_.work_event is not null
+            or split_work_events.work_event_split in ('Ordinary (H)', 'Ordinary (M)', 'Worked Hours'),
+            'keep', 'remove'
+        ) as flag_work_event_split,
+        split_work_events.key_,
+        split_work_events.index_row,
+        split_work_events.work_event_split
+    from split_work_events
+    left join work_events_filter as filter_
+        on filter_.work_event = split_work_events.work_event_split
+        and filter_.country = split_work_events.country
+),
+flag_work_events_rows as (
+    select 
+        key_,
+        LISTAGG(flag_work_event_split, ',') within group (order by index_row) as work_event,
+        iff(contains(work_event, 'remove'), 'remove', 'keep') as flag_work_event
+    from flag_work_events
+    group by all
+),
+final as (
+    select distinct
+        country,
+        TRIM(LTRIM(RTRIM(word.value, ' '), ' '), '""') as pay_leave_type,
+        flag_work_events_rows.flag_work_event,
+        max(shifts.shift_date) as latest_shift,
+        sum(n_hours) as nr_hours
+    from model_workforce_shifts as shifts
+    inner join flag_work_events_rows
+        on shifts.key_ = flag_work_events_rows.key_,
+    lateral flatten(input => split(pay_leave_type, '&')) as word
+    where
+        flag_work_events_rows.flag_work_event = 'remove'
+        and shifts.n_hours > 0
+    group by all
+)
+select
+    final.country,
+    final.pay_leave_type,
+    final.flag_work_event as outcome,
+    final.latest_shift,
+    round(final.nr_hours) as nr_hours
+from final
+left join mart.workforce.workforce_mapping as mapping
+    on final.pay_leave_type = mapping.second_export_name
+    and final.country = mapping.country
+where mapping.country is null
+order by nr_hours desc;
