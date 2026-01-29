@@ -41,7 +41,7 @@ History_Pivoted AS (
     GROUP BY EMAIL
 )
 SELECT 
-    w.WF_ID, -- Updated to use w.WF_ID directly
+    w.WF_ID,
     w.EMAIL_ADDRESS AS EMAIL,
     h.COUNTRY AS hb_COUNTRY,
     
@@ -56,14 +56,17 @@ SELECT
     -- Teams Logic
     w.TEAM_NAME AS wf_TEAM_NAME,
     
-    -- NEW: WF_TEAM_CHECK (Default Department Logic)
+    -- NEW: WF_TEAM_CHECK (Includes Poland Logic)
     CASE 
+        WHEN h.COUNTRY = 'Poland' OR TO_VARCHAR(h.COUNTRY) = '264940782' THEN 'Central Warehouse'
         WHEN h.COST_CENTRE LIKE '%360%' THEN 'WH & Repairs'
         WHEN h.COST_CENTRE LIKE '%410%' THEN 'Field Ops'
         ELSE ''
     END AS WF_TEAM_CHECK,
 
+    -- Updated TEAMS Logic (Includes Poland Logic)
     CASE 
+        WHEN h.COUNTRY = 'Poland' OR TO_VARCHAR(h.COUNTRY) = '264940782' THEN 'Central Warehouse,Spare Parts Refurbishment,Vehicle Refurbishment'
         WHEN h.COST_CENTRE LIKE '%410%' THEN 'Field Ops,WH & Repairs,Inventory Work'
         WHEN h.COST_CENTRE LIKE '%360%' THEN 'WH & Repairs,Inventory Work,Field Ops'
         ELSE ''
