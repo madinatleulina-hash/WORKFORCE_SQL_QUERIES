@@ -1,0 +1,40 @@
+SELECT 
+    h.DISPLAY_NAME AS NAME,
+    h.EMAIL AS EMAIL,
+    h.START_DATE AS "EMPLOYMENT START DATE",
+    h.WEEKLY_HOURS AS "PREFERRED HOURS",
+    
+    -- TEAMS (Existing Logic)
+    CASE 
+        WHEN h.COST_CENTRE LIKE '%410%' THEN 'Field Ops,WH & Repairs,Inventory Work'
+        WHEN h.COST_CENTRE LIKE '%360%' THEN 'WH & Repairs,Inventory Work,Field Ops'
+        ELSE ''
+    END AS TEAMS,
+
+    h.SITE AS "DEFAULT LOCATION NAME",
+
+    -- DEFAULT DEPARTMENT NAME (New Logic)
+    CASE 
+        WHEN h.COST_CENTRE LIKE '%360%' THEN 'WH & Repairs'
+        WHEN h.COST_CENTRE LIKE '%410%' THEN 'Field Ops'
+        ELSE ''
+    END AS "DEFAULT DEPARTMENT NAME",
+
+    -- USER ROLES (Permissions Logic based on Job Title)
+    CASE 
+        WHEN h.JOB_TITLE ILIKE '%fleet manager%' OR h.JOB_TITLE ILIKE '%head of fleet%' THEN 'TL/SM/FM'
+        WHEN h.JOB_TITLE ILIKE '%team lead%' 
+             OR h.JOB_TITLE ILIKE '%site manager%' 
+             OR h.JOB_TITLE ILIKE '%shift supervisor%' THEN 'TL/SM/FM,Employee'
+        ELSE 'Employee'
+    END AS "USER ROLES",
+
+    h.WEEKLY_HOURS AS "CONTRACTED WEEKLY HOURS",
+
+    -- COST CENTRE (Numbers Only)
+    REGEXP_REPLACE(TO_VARCHAR(h.COST_CENTRE), '[^0-9]', '') AS "COST CENTRE"
+
+FROM MODEL_CONFIDENTIAL.HIBOB.HIBOB h
+
+-- Filter for starts in the current month
+WHERE DATE_TRUNC('MONTH', TRY_TO_DATE(h.START_DATE)) = DATE_TRUNC('MONTH', CURRENT_DATE());
